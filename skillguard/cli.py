@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 HIDDEN_CHARS = {
     "\u200b": "zero-width space",
@@ -51,6 +51,8 @@ SMUGGLE_RE = re.compile(
 )
 
 TEXT_GLOBS = {".md", ".txt", ".py", ".js", ".ts", ".sh", ".bash", ".zsh", ".json", ".yml", ".yaml", ".rb", ".go"}
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules", ".tox", ".mypy_cache"}
+MAX_FILE_BYTES = 2_000_000
 
 
 @dataclass
@@ -63,12 +65,40 @@ class Finding:
 
 
 def iter_text_files(root: Path) -> list[Path]:
-    files = []
-    for path in root.rglob("*"):
-        if not path.is_file():
+    """Walk a skill tree without following directory symlinks or leaving root."""
+    files: list[Path] = []
+    root = root.resolve()
+    stack = [root]
+    seen: set[Path] = set()
+    while stack:
+        current = stack.pop()
+        try:
+            resolved = current.resolve()
+        except OSError:
             continue
-        if path.suffix.lower() in TEXT_GLOBS or path.name == "SKILL.md":
-            files.append(path)
+        if resolved in seen:
+            continue
+        if current.is_symlink() and current.is_dir():
+            continue
+        try:
+            if resolved != root and not resolved.is_relative_to(root):
+                continue
+        except ValueError:
+            continue
+        seen.add(resolved)
+        if current.is_dir():
+            try:
+                children = list(current.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if child.is_dir() and not child.is_symlink() and child.name not in SKIP_DIRS:
+                    stack.append(child)
+                elif child.is_file():
+                    stack.append(child)
+            continue
+        if current.is_file() and (current.suffix.lower() in TEXT_GLOBS or current.name.lower() == "skill.md"):
+            files.append(current)
     return sorted(files)
 
 
@@ -99,16 +129,40 @@ def scan_text(text: str, path: Path) -> list[Finding]:
     return findings
 
 
+def read_text_capped(path: Path) -> tuple[str | None, Finding | None]:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return None, Finding("warning", "unreadable-file", f"could not read file: {exc}", str(path), None)
+    if size > MAX_FILE_BYTES:
+        return None, Finding(
+            "warning",
+            "file-too-large",
+            f"skipped file larger than {MAX_FILE_BYTES} bytes",
+            str(path),
+            None,
+        )
+    return path.read_text(encoding="utf-8", errors="replace"), None
+
+
 def scan_root(root: Path) -> list[Finding]:
     root = root.resolve()
     if root.is_file():
-        return scan_text(root.read_text(encoding="utf-8", errors="replace"), root)
+        text, skipped = read_text_capped(root)
+        if skipped:
+            return [skipped]
+        return scan_text(text or "", root)
     findings: list[Finding] = []
-    skill_md = list(root.rglob("SKILL.md")) + [p for p in root.rglob("*") if p.is_file() and p.name.lower() == "skill.md"]
+    text_files = iter_text_files(root)
+    skill_md = [p for p in text_files if p.name.lower() == "skill.md"]
     if not skill_md:
         findings.append(Finding("warning", "no-skill-md", "no SKILL.md found in this folder", str(root), None))
-    for path in iter_text_files(root):
-        findings.extend(scan_text(path.read_text(encoding="utf-8", errors="replace"), path))
+    for path in text_files:
+        text, skipped = read_text_capped(path)
+        if skipped:
+            findings.append(skipped)
+            continue
+        findings.extend(scan_text(text or "", path))
     return findings
 
 
